@@ -124,39 +124,60 @@ def verify_credentials(identifier, password):
     if "@" in identifier:
         user_id = EMAIL_TO_ID.get(identifier.lower())
         if not user_id:
-            logger.warning(f"❌ UNKNOWN EMAIL | Attempt with unknown email")
+            log_security_event("UNKNOWN_EMAIL", None, f"Attempt: {identifier[:5]}...")
             return None
     else:
         user_id = identifier
     
     # Verifica user_id esiste
     if user_id not in USER_CREDENTIALS:
-        logger.warning(f"❌ UNKNOWN USER | {user_id}")
+        log_security_event("UNKNOWN_USER", user_id, None)
         return None
     
     # Verifica password
     pwd_hash = hashlib.sha256(password.encode()).hexdigest()
     if USER_CREDENTIALS[user_id] != pwd_hash:
-        logger.warning(f"❌ INVALID PWD | User: {user_id}")
+        log_security_event("INVALID_PASSWORD", user_id, f"Attempt with wrong password")
         return None
     
     return user_id
 
-# ========== LOGGING QUERY ==========
+# ========== SECURE LOGGING ==========
 def log_query(mode, question, model=None):
-    """Log query dettagliata"""
+    """Log query con privacy garantita - solo hash e preview"""
+    # Hash domanda (irreversibile, per identificare duplicati)
+    question_hash = hashlib.sha256(question.encode()).hexdigest()[:12]
+    
+    # Preview primi 25 caratteri (per debug, non troppo)
+    preview = question[:25] if len(question) > 25 else question
+    
+    # Metadata aggiuntivi
+    question_length = len(question)
+    
     logger.info(
         f"QUERY | User: {st.session_state.user_id} | "
         f"Session: {st.session_state.session_id} | "
         f"Mode: {mode} | Model: {model or 'multiple'} | "
-        f"Q: {question[:150]}..."
+        f"Preview: {preview}{'...' if len(question) > 25 else ''} | "
+        f"Hash: {question_hash} | Len: {question_length}"
     )
 
 def log_response(mode, response_length):
-    """Log risposta"""
+    """Log risposta - solo metadata"""
     logger.info(
         f"RESPONSE | User: {st.session_state.user_id} | "
         f"Mode: {mode} | Length: {response_length} chars"
+    )
+
+def log_security_event(event_type, identifier=None, details=None):
+    """Log eventi sicurezza - dettagli hash"""
+    # Hash dettagli sensibili
+    details_hash = hashlib.sha256(str(details).encode()).hexdigest()[:12] if details else "N/A"
+    
+    logger.warning(
+        f"SECURITY | Event: {event_type} | "
+        f"Identifier: {identifier or 'unknown'} | "
+        f"Details_Hash: {details_hash}"
     )
 
 # ========== LOGIN PAGE ==========
@@ -273,14 +294,15 @@ def query_groq(model, system_msg, user_msg):
         return f"Errore API: {str(e)}"
 
 # ========== CHAT FUNCTIONS ==========
-def add_message(role, content, mode=None, model=None):
+def add_message(role, content, mode=None, model=None, individual_responses=None):
     """Aggiungi messaggio alla cronologia"""
     message = {
         "role": role,
         "content": content,
         "timestamp": datetime.now(),
         "mode": mode,
-        "model": model
+        "model": model,
+        "individual_responses": individual_responses  # Store individual responses
     }
     st.session_state.messages.append(message)
 
@@ -295,6 +317,16 @@ def display_chat_history():
                 st.markdown(msg["content"])
                 if msg.get("mode"):
                     st.caption(f"🎯 {msg['mode']} | 🤖 {msg.get('model', 'Multiple models')}")
+                
+                # Show individual responses if available
+                if msg.get("individual_responses"):
+                    responses = msg["individual_responses"]
+                    with st.expander(f"📊 Vedi {len(responses)} Risposte Individuali"):
+                        for i, (role, response) in enumerate(responses, 1):
+                            st.markdown(f"**{i}. {role}**")
+                            st.info(response)
+                            if i < len(responses):
+                                st.markdown("---")
 
 def process_query(question, mode):
     """Processa query e genera risposta"""
@@ -324,13 +356,17 @@ def process_query(question, mode):
                     ("qwen/qwen3-32b", "Pensatore Critico", "Prospettive alternative e analisi critica")
                 ]
                 
-                responses = []
+                # Collect individual responses
+                individual_responses = []
+                responses_for_synthesis = []
+                
                 for model, role, goal in agents:
                     r = query_groq(model, f"Sei un {role}. {goal}.", question)
-                    responses.append(f"{role}: {r}")
+                    individual_responses.append((role, r))
+                    responses_for_synthesis.append(f"{role}: {r}")
                 
                 # Synthesis
-                synth = "Sintetizza queste 3 analisi in una risposta coerente e completa:\n\n" + "\n\n".join(responses)
+                synth = "Sintetizza queste 3 analisi in una risposta coerente e completa:\n\n" + "\n\n".join(responses_for_synthesis)
                 risposta = query_groq(
                     "llama-3.3-70b-versatile",
                     "Sintetizza le analisi mantenendo i punti chiave di ciascuna prospettiva.",
@@ -347,18 +383,20 @@ def process_query(question, mode):
                     ("meta-llama/llama-4-scout-17b-16e-instruct", "Verificatore")
                 ]
                 
-                responses = []
+                individual_responses = []
+                responses_for_synthesis = []
                 progress = st.progress(0)
                 status = st.empty()
                 
                 for i, (model, role) in enumerate(agents):
                     status.text(f"⏳ Agente {i+1}/5: {role}...")
                     r = query_groq(model, f"Sei un {role}.", question)
-                    responses.append(f"{role}: {r}")
+                    individual_responses.append((role, r))
+                    responses_for_synthesis.append(f"{role}: {r}")
                     progress.progress((i+1)/6)
                 
                 status.text("🎯 Sintesi finale approfondita...")
-                synth = "Crea una sintesi completa da queste 5 analisi:\n\n" + "\n\n".join(responses)
+                synth = "Crea una sintesi completa da queste 5 analisi:\n\n" + "\n\n".join(responses_for_synthesis)
                 risposta = query_groq("llama-3.3-70b-versatile", "Sintesi approfondita.", synth)
                 
                 progress.progress(1.0)
@@ -377,18 +415,20 @@ def process_query(question, mode):
                     ("meta-llama/llama-guard-4-12b", "Verificatore Globale")
                 ]
                 
-                responses = []
+                individual_responses = []
+                responses_for_synthesis = []
                 progress = st.progress(0)
                 status = st.empty()
                 
                 for i, (model, role) in enumerate(agents):
                     status.text(f"⏳ Agente {i+1}/6: {role}...")
                     r = query_groq(model, f"Sei un {role}.", question)
-                    responses.append(f"{role}: {r}")
+                    individual_responses.append((role, r))
+                    responses_for_synthesis.append(f"{role}: {r}")
                     progress.progress((i+1)/7)
                 
                 status.text("🎯 Super-sintesi master in corso...")
-                synth = "Crea una sintesi definitiva master da queste 6 analisi esperte:\n\n" + "\n\n".join(responses)
+                synth = "Crea una sintesi definitiva master da queste 6 analisi esperte:\n\n" + "\n\n".join(responses_for_synthesis)
                 risposta = query_groq("llama-3.3-70b-versatile", "Sintesi master definitiva.", synth)
                 
                 progress.progress(1.0)
@@ -400,9 +440,19 @@ def process_query(question, mode):
         # Display response
         st.markdown(risposta)
         st.caption(f"🎯 {mode} | 🤖 {model_info} | 💰 $0.00")
+        
+        # Display individual responses if multi-model mode
+        if mode != "QUICK" and 'individual_responses' in locals():
+            with st.expander(f"📊 Vedi {len(individual_responses)} Risposte Individuali"):
+                for i, (role, response) in enumerate(individual_responses, 1):
+                    st.markdown(f"**{i}. {role}**")
+                    st.info(response)
+                    if i < len(individual_responses):
+                        st.markdown("---")
     
-    # Add assistant message
-    add_message("assistant", risposta, mode, model_info)
+    # Add assistant message with individual responses if available
+    individual_resp = individual_responses if 'individual_responses' in locals() else None
+    add_message("assistant", risposta, mode, model_info, individual_resp)
     
     # Log response
     log_response(mode, len(risposta))
@@ -416,14 +466,15 @@ if not is_session_valid():
 
 # ========== CHAT INTERFACE ==========
 
-# Custom CSS
+# Custom CSS - Dark Mode Compatible
 st.markdown("""
 <style>
+    /* Main title */
     .main-title {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 1.5rem;
         border-radius: 10px;
-        color: white;
+        color: white !important;
         text-align: center;
         margin-bottom: 1rem;
         box-shadow: 0 4px 8px rgba(0,0,0,0.1);
@@ -431,16 +482,39 @@ st.markdown("""
     .main-title h2 {
         margin: 0;
         font-weight: 700;
+        color: white !important;
     }
     .main-title p {
         margin: 0.5rem 0 0 0;
         opacity: 0.9;
+        color: white !important;
     }
+    
+    /* Chat messages - dark mode compatible */
     .stChatMessage {
-        background-color: #f8f9fa;
         border-radius: 10px;
         padding: 1rem;
         margin: 0.5rem 0;
+    }
+    
+    /* Force readable text in all modes */
+    .stChatMessage p, .stChatMessage div {
+        color: inherit !important;
+    }
+    
+    /* Expander styling for dark mode */
+    .streamlit-expanderHeader {
+        font-weight: 600;
+    }
+    
+    /* Info boxes */
+    .stInfo, .stWarning, .stError, .stSuccess {
+        border-radius: 8px;
+    }
+    
+    /* Ensure captions are visible */
+    .stCaptionContainer {
+        opacity: 0.8;
     }
 </style>
 """, unsafe_allow_html=True)
