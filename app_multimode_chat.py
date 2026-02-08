@@ -49,6 +49,18 @@ SESSION_TIMEOUT_HOURS = 24
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_DURATION_MINUTES = 60
 
+# Password reset config
+RESET_TOKEN_EXPIRY_HOURS = 1
+if 'reset_tokens' not in st.session_state:
+    st.session_state.reset_tokens = {}  # {token: {user_id, email, expires}}
+
+# Email config (optional - for password reset)
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")
+
 # ========== VERIFICA ==========
 if not MASTER_GROQ_KEY:
     st.error("⚠️ GROQ_API_KEY non configurata. Contatta l'amministratore.")
@@ -142,6 +154,90 @@ def verify_credentials(identifier, password):
     
     return user_id
 
+# ========== PASSWORD RESET ==========
+def generate_reset_token():
+    """Genera token univoco per reset password"""
+    return str(uuid.uuid4())
+
+def create_reset_token(email):
+    """Crea token reset per email"""
+    user_id = EMAIL_TO_ID.get(email.lower())
+    if not user_id:
+        return None
+    
+    token = generate_reset_token()
+    expires = datetime.now() + timedelta(hours=RESET_TOKEN_EXPIRY_HOURS)
+    
+    st.session_state.reset_tokens[token] = {
+        'user_id': user_id,
+        'email': email,
+        'expires': expires
+    }
+    
+    logger.info(f"PASSWORD RESET | Token created for user: {user_id}")
+    return token
+
+def verify_reset_token(token):
+    """Verifica validità token reset"""
+    if token not in st.session_state.reset_tokens:
+        return None
+    
+    token_data = st.session_state.reset_tokens[token]
+    
+    # Check scadenza
+    if datetime.now() > token_data['expires']:
+        del st.session_state.reset_tokens[token]
+        return None
+    
+    return token_data
+
+def send_reset_email(email, reset_link):
+    """Invia email con link reset password"""
+    # Se SMTP non configurato, mostra link direttamente
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        return reset_link  # Ritorna link per mostrare a utente
+    
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = "Reset Password - Multi-AI Chat"
+        msg['From'] = SMTP_USERNAME
+        msg['To'] = email
+        
+        # Email body
+        html = f"""
+        <html>
+          <body>
+            <h2>Reset Password Multi-AI Chat</h2>
+            <p>Hai richiesto di recuperare la tua password.</p>
+            <p>Clicca sul link qui sotto per reimpostare la password:</p>
+            <p><a href="{reset_link}" style="background-color: #667eea; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block;">Reset Password</a></p>
+            <p>Il link è valido per {RESET_TOKEN_EXPIRY_HOURS} ora.</p>
+            <p>Se non hai richiesto questo reset, ignora questa email.</p>
+            <hr>
+            <p style="color: #999; font-size: 12px;">Multi-AI Chat System</p>
+          </body>
+        </html>
+        """
+        
+        part = MIMEText(html, 'html')
+        msg.attach(part)
+        
+        # Send
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        
+        logger.info(f"PASSWORD RESET | Email sent to: {email}")
+        return True
+    except Exception as e:
+        logger.error(f"PASSWORD RESET | Email failed: {e}")
+        return reset_link  # Fallback: mostra link
+
 # ========== SECURE LOGGING ==========
 def log_query(mode, question, model=None):
     """Log query con privacy garantita - solo hash e preview"""
@@ -182,6 +278,12 @@ def log_security_event(event_type, identifier=None, details=None):
 
 # ========== LOGIN PAGE ==========
 def show_login():
+    """Mostra pagina di login"""
+    
+    # Check if showing reset password form
+    if 'show_reset_form' not in st.session_state:
+        st.session_state.show_reset_form = False
+    
     st.markdown("""
     <style>
     .login-header {
@@ -215,56 +317,115 @@ def show_login():
     col1, col2, col3 = st.columns([1, 2, 1])
     
     with col2:
-        st.markdown("### 🔑 Accedi al Sistema")
-        
-        identifier = st.text_input(
-            "Email o User ID",
-            placeholder="email@esempio.com",
-            key="login_id"
-        )
-        
-        password = st.text_input(
-            "Password",
-            type="password",
-            key="login_pwd"
-        )
-        
-        if st.button("🚀 Inizia Conversazione", use_container_width=True, type="primary"):
-            if not identifier or not password:
-                st.error("❌ Inserisci credenziali")
-                return
+        # Reset password form
+        if st.session_state.show_reset_form:
+            st.markdown("### 🔑 Recupera Password")
             
-            # Rate limiting
-            is_limited, minutes = is_rate_limited(identifier.lower())
-            if is_limited:
-                st.error(f"🚫 Troppi tentativi. Riprova tra {minutes} minuti.")
-                return
+            reset_email = st.text_input(
+                "Inserisci la tua email",
+                placeholder="email@esempio.com",
+                key="reset_email_input"
+            )
             
-            # Verifica
-            user_id = verify_credentials(identifier, password)
-            if user_id:
-                login_user(user_id)
-                st.success("✅ Accesso effettuato!")
-                st.rerun()
-            else:
-                record_attempt(identifier.lower())
-                remaining = MAX_LOGIN_ATTEMPTS - len(st.session_state.login_attempts[identifier.lower()])
-                if remaining > 0:
-                    st.error(f"❌ Credenziali errate. Tentativi rimasti: {remaining}")
-                else:
-                    st.error(f"🚫 Account bloccato per {LOCKOUT_DURATION_MINUTES} minuti")
+            col_back, col_send = st.columns(2)
+            
+            with col_back:
+                if st.button("← Torna al Login", use_container_width=True):
+                    st.session_state.show_reset_form = False
+                    st.rerun()
+            
+            with col_send:
+                if st.button("📧 Invia Link Reset", use_container_width=True, type="primary"):
+                    if not reset_email:
+                        st.error("❌ Inserisci la tua email")
+                    elif reset_email.lower() not in EMAIL_TO_ID:
+                        st.error("❌ Email non trovata nel sistema")
+                    else:
+                        # Crea token
+                        token = create_reset_token(reset_email)
+                        if token:
+                            # Genera link (usa URL corrente o configurato)
+                            app_url = os.getenv("APP_URL", "http://localhost:8501")
+                            reset_link = f"{app_url}?reset_token={token}"
+                            
+                            # Invia email
+                            result = send_reset_email(reset_email, reset_link)
+                            
+                            if result == True:
+                                st.success("✅ Email inviata! Controlla la tua casella di posta.")
+                                logger.info(f"PASSWORD RESET | Link sent to: {reset_email}")
+                            elif isinstance(result, str):
+                                # SMTP non configurato - mostra link direttamente
+                                st.warning("⚠️ Email non configurata. Usa questo link:")
+                                st.code(result, language=None)
+                                st.caption(f"Link valido per {RESET_TOKEN_EXPIRY_HOURS} ora")
+                                logger.info(f"PASSWORD RESET | Link generated: {reset_email}")
+                            else:
+                                st.error("❌ Errore invio email. Contatta l'amministratore.")
+            
+            st.markdown("---")
+            st.info("💡 Riceverai un'email con un link per reimpostare la password")
         
-        st.markdown("---")
-        st.info("""
-        💬 **Sistema Chat Multi-AI**
-        
-        Interfaccia conversazionale come ChatGPT con:
-        • 4 modalità (Quick, Standard, Deep, Expert)
-        • Cronologia conversazione
-        • Privacy garantita con log anonimi
-        """)
-        st.caption("🔒 Le tue email non appaiono mai nei log di sistema")
-        st.caption(f"🛡️ Massimo {MAX_LOGIN_ATTEMPTS} tentativi di accesso")
+        # Normal login form
+        else:
+            st.markdown("### 🔑 Accedi al Sistema")
+            
+            identifier = st.text_input(
+                "Email o User ID",
+                placeholder="email@esempio.com",
+                key="login_id"
+            )
+            
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="login_pwd"
+            )
+            
+            col_login, col_forgot = st.columns([2, 1])
+            
+            with col_login:
+                if st.button("🚀 Inizia Conversazione", use_container_width=True, type="primary"):
+                    if not identifier or not password:
+                        st.error("❌ Inserisci credenziali")
+                        return
+                    
+                    # Rate limiting
+                    is_limited, minutes = is_rate_limited(identifier.lower())
+                    if is_limited:
+                        st.error(f"🚫 Troppi tentativi. Riprova tra {minutes} minuti.")
+                        return
+                    
+                    # Verifica
+                    user_id = verify_credentials(identifier, password)
+                    if user_id:
+                        login_user(user_id)
+                        st.success("✅ Accesso effettuato!")
+                        st.rerun()
+                    else:
+                        record_attempt(identifier.lower())
+                        remaining = MAX_LOGIN_ATTEMPTS - len(st.session_state.login_attempts[identifier.lower()])
+                        if remaining > 0:
+                            st.error(f"❌ Credenziali errate. Tentativi rimasti: {remaining}")
+                        else:
+                            st.error(f"🚫 Account bloccato per {LOCKOUT_DURATION_MINUTES} minuti")
+            
+            with col_forgot:
+                if st.button("🔑 Password?", use_container_width=True):
+                    st.session_state.show_reset_form = True
+                    st.rerun()
+            
+            st.markdown("---")
+            st.info("""
+            💬 **Sistema Chat Multi-AI**
+            
+            Interfaccia conversazionale come ChatGPT con:
+            • 4 modalità (Quick, Standard, Deep, Expert)
+            • Cronologia conversazione
+            • Privacy garantita con log anonimi
+            """)
+            st.caption("🔒 Le tue email non appaiono mai nei log di sistema")
+            st.caption(f"🛡️ Massimo {MAX_LOGIN_ATTEMPTS} tentativi di accesso")
 
 # ========== GROQ API ==========
 def query_groq(model, system_msg, user_msg):
@@ -362,7 +523,8 @@ def process_query(question, mode):
                 
                 for model, role, goal in agents:
                     r = query_groq(model, f"Sei un {role}. {goal}.", question)
-                    individual_responses.append((role, r))
+                    # Store with model name for display
+                    individual_responses.append((f"{role} - {model}", r))
                     responses_for_synthesis.append(f"{role}: {r}")
                 
                 # Synthesis
@@ -380,7 +542,7 @@ def process_query(question, mode):
                     ("llama-3.3-70b-versatile", "Stratega"),
                     ("openai/gpt-oss-20b", "Esperto Pratico"),
                     ("qwen/qwen3-32b", "Pensatore Alternativo"),
-                    ("meta-llama/llama-4-scout-17b-16e-instruct", "Verificatore")
+                    ("gemma2-9b-it", "Verificatore")
                 ]
                 
                 individual_responses = []
@@ -391,7 +553,8 @@ def process_query(question, mode):
                 for i, (model, role) in enumerate(agents):
                     status.text(f"⏳ Agente {i+1}/5: {role}...")
                     r = query_groq(model, f"Sei un {role}.", question)
-                    individual_responses.append((role, r))
+                    # Store with model name
+                    individual_responses.append((f"{role} - {model}", r))
                     responses_for_synthesis.append(f"{role}: {r}")
                     progress.progress((i+1)/6)
                 
@@ -409,10 +572,10 @@ def process_query(question, mode):
                 agents = [
                     ("llama-3.1-8b-instant", "Analista Veloce"),
                     ("llama-3.3-70b-versatile", "Stratega Master"),
-                    ("openai/gpt-oss-120b", "Pensatore Profondo"),
+                    ("llama3-70b-8192", "Pensatore Profondo"),
                     ("openai/gpt-oss-20b", "Esperto Pratico"),
                     ("qwen/qwen3-32b", "Critico Costruttivo"),
-                    ("meta-llama/llama-guard-4-12b", "Verificatore Globale")
+                    ("gemma2-9b-it", "Verificatore Globale")
                 ]
                 
                 individual_responses = []
@@ -423,7 +586,8 @@ def process_query(question, mode):
                 for i, (model, role) in enumerate(agents):
                     status.text(f"⏳ Agente {i+1}/6: {role}...")
                     r = query_groq(model, f"Sei un {role}.", question)
-                    individual_responses.append((role, r))
+                    # Store with model name
+                    individual_responses.append((f"{role} - {model}", r))
                     responses_for_synthesis.append(f"{role}: {r}")
                     progress.progress((i+1)/7)
                 
@@ -460,6 +624,88 @@ def process_query(question, mode):
 # ========== MAIN ==========
 init_session()
 
+# Check for password reset token in URL
+query_params = st.query_params
+if 'reset_token' in query_params:
+    token = query_params['reset_token']
+    token_data = verify_reset_token(token)
+    
+    if token_data:
+        st.markdown("""
+        <div class="login-header" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 2rem; border-radius: 15px; color: white; text-align: center; margin-bottom: 2rem;">
+            <h1>🔐 Reset Password</h1>
+            <p>Crea una nuova password per il tuo account</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        
+        with col2:
+            st.info(f"📧 Account: {token_data['email']}")
+            
+            new_password = st.text_input(
+                "Nuova Password",
+                type="password",
+                placeholder="Minimo 8 caratteri",
+                key="new_pwd"
+            )
+            
+            confirm_password = st.text_input(
+                "Conferma Password",
+                type="password",
+                placeholder="Ripeti la password",
+                key="confirm_pwd"
+            )
+            
+            if st.button("✅ Reimposta Password", use_container_width=True, type="primary"):
+                if not new_password or not confirm_password:
+                    st.error("❌ Compila entrambi i campi")
+                elif len(new_password) < 8:
+                    st.error("❌ Password troppo corta (minimo 8 caratteri)")
+                elif new_password != confirm_password:
+                    st.error("❌ Le password non coincidono")
+                else:
+                    st.warning("""
+                    ⚠️ **IMPORTANTE**: Per completare il reset, devi:
+                    
+                    1. Contattare l'amministratore
+                    2. Comunicare questa password: `{}`
+                    3. L'admin aggiornerà il sistema
+                    
+                    **Perché?** Per sicurezza, le password sono gestite centralmente.
+                    Non possiamo modificarle direttamente dall'app per evitare vulnerabilità.
+                    """.format(new_password))
+                    
+                    # Log richiesta
+                    logger.warning(f"PASSWORD RESET REQUEST | User: {token_data['user_id']} | Email: {token_data['email']}")
+                    
+                    # Opzionale: invia email ad admin
+                    if ADMIN_EMAIL:
+                        admin_msg = f"""
+                        Password reset richiesta:
+                        - User ID: {token_data['user_id']}
+                        - Email: {token_data['email']}
+                        - Nuova password: {new_password}
+                        
+                        Aggiorna USER_CREDENTIALS con il nuovo hash:
+                        {hashlib.sha256(new_password.encode()).hexdigest()}
+                        """
+                        st.code(f"Hash da usare:\n{hashlib.sha256(new_password.encode()).hexdigest()}")
+                    
+                    # Invalida token
+                    del st.session_state.reset_tokens[token]
+            
+            st.markdown("---")
+            st.caption(f"🕐 Link valido fino a: {token_data['expires'].strftime('%H:%M:%S')}")
+    else:
+        st.error("❌ Link di reset non valido o scaduto")
+        if st.button("← Torna al Login"):
+            st.query_params.clear()
+            st.rerun()
+    
+    st.stop()
+
+# Normal authentication flow
 if not is_session_valid():
     show_login()
     st.stop()
@@ -502,9 +748,21 @@ st.markdown("""
         color: inherit !important;
     }
     
-    /* Expander styling for dark mode */
+    /* Expander styling - no auto-scroll */
     .streamlit-expanderHeader {
         font-weight: 600;
+    }
+    
+    /* Prevent scroll-into-view on expander */
+    details[open] {
+        scroll-margin-top: 0 !important;
+    }
+    
+    /* Expander content container */
+    .streamlit-expanderContent {
+        max-height: 600px;
+        overflow-y: auto;
+        scroll-behavior: smooth;
     }
     
     /* Info boxes */
@@ -515,6 +773,14 @@ st.markdown("""
     /* Ensure captions are visible */
     .stCaptionContainer {
         opacity: 0.8;
+    }
+    
+    /* Model name styling in responses */
+    .element-container code {
+        background-color: rgba(102, 126, 234, 0.1);
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.85em;
     }
 </style>
 """, unsafe_allow_html=True)
